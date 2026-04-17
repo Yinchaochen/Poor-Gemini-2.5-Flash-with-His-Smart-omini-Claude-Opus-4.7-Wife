@@ -53,9 +53,8 @@ def run(workflow_name: str, task: str, engine: str) -> None:
 
 
 def main() -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY not set.")
-        sys.exit(1)
+    # ANTHROPIC_API_KEY only required if Opus is actually called (complex tasks).
+    # We check lazily inside Consultant — no hard exit here.
 
     parser = argparse.ArgumentParser(description="AI Agent Workflow Runner")
     parser.add_argument("--workflow", "-w", help="Workflow name")
@@ -63,8 +62,8 @@ def main() -> None:
     parser.add_argument(
         "--engine", "-e",
         choices=ENGINES,
-        default="claude",
-        help="Worker engine: 'claude' (Sonnet 4.6) or 'gemini' (Gemini 2.5 Flash). Default: claude",
+        default="gemini",
+        help="Worker engine: 'gemini' (Gemini 2.5 Flash, default) or 'claude' (Sonnet 4.6)",
     )
     parser.add_argument("--list", "-l", action="store_true", help="List options")
     args = parser.parse_args()
@@ -83,7 +82,7 @@ def main() -> None:
         list_workflows()
         wf = input("Select workflow: ").strip()
         task = input("Enter task: ").strip()
-        engine = input(f"Engine [{'/'.join(ENGINES)}] (default: claude): ").strip() or "claude"
+        engine = input(f"Engine [{'/'.join(ENGINES)}] (default: gemini): ").strip() or "gemini"
         run(wf, task, engine)
         return
 

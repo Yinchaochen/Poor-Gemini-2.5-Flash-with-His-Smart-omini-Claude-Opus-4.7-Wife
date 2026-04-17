@@ -1,115 +1,100 @@
 """
 Runner — the workflow execution engine.
 
-Orchestration loop:
-  1. Consultant plans → list of steps
-  2. For each step:
-       a. Resolve {{step_N}} placeholders with prior results
-       b. Worker executes
-       c. Consultant reviews — if rejected, worker revises (max MAX_REVISIONS times)
-  3. Consultant synthesizes all results → final output
+Orchestration logic (Gemini-first with on-demand Opus escalation):
+  1. Worker receives the task and assesses complexity.
+  2. Simple path  → worker completes the task alone (Opus never called).
+  3. Complex path → worker asks Consultant (Opus) for guidance,
+                    then executes the task using that guidance.
 """
 
-import re
 from .consultant import Consultant
 from .worker import Worker
-
-
-MAX_REVISIONS = 2  # how many times a worker can be asked to revise one step
+from .gemini_worker import GeminiWorker
 
 
 class Runner:
-    def __init__(self, agents: dict) -> None:
+    def __init__(self, agents: dict, engine: str = "gemini") -> None:
         """
-        agents: {name: BaseAgent}  — populated by the Workflow
+        agents: {name: BaseAgent}  — populated by the Workflow.
+        engine: "gemini" | "claude" — which worker model to use.
         """
         self._agents = agents
-        self._consultant = Consultant()
+        self._engine = engine
+        self._consultant: Consultant | None = None  # lazy — only created if needed
+
+    def _get_consultant(self) -> Consultant:
+        if self._consultant is None:
+            self._consultant = Consultant()
+        return self._consultant
+
+    def _make_worker(self) -> Worker | GeminiWorker:
+        if self._engine == "gemini":
+            return GeminiWorker()
+        return Worker()
 
     # ------------------------------------------------------------------
     def run(self, task: str, verbose: bool = True) -> str:
-        agent_names = list(self._agents.keys())
+        """
+        Run a task through the worker, escalating to Opus only if complex.
+        Uses the first agent's system_prompt as the worker's role context.
+        """
+        # Pick the first (or only) agent's system prompt as the role
+        if not self._agents:
+            raise ValueError("No agents registered in this workflow.")
 
-        # ── 1. Plan ────────────────────────────────────────────────────
+        # For multi-agent workflows, concatenate all agent prompts as context
+        agent_context = "\n\n".join(
+            f"[{name} role]\n{agent.system_prompt}"
+            for name, agent in self._agents.items()
+        )
+
+        worker = self._make_worker()
+
+        # ── 1. Assess complexity ───────────────────────────────────────
         if verbose:
-            print(f"\n[Consultant] Planning task with agents: {agent_names}")
-        steps = self._consultant.plan(task, agent_names)
+            print(f"\n[Worker:{self._engine}] Assessing task complexity…")
+
+        assessment = worker.assess_complexity(task)
+        is_complex: bool = assessment.get("is_complex", False)
+        reason: str = assessment.get("reason", "")
+
         if verbose:
-            for s in steps:
-                print(f"  Step {s['id']} → [{s['agent']}]: {s['instructions'][:80]}…")
+            label = "COMPLEX" if is_complex else "SIMPLE"
+            print(f"  → {label}: {reason}")
 
-        # ── 2. Execute ─────────────────────────────────────────────────
-        results: dict[int, str] = {}
-
-        for step in steps:
-            step_id: int = step["id"]
-            agent_name: str = step["agent"]
-            instructions: str = step["instructions"]
-
-            if agent_name not in self._agents:
-                raise ValueError(
-                    f"Step {step_id} requests unknown agent '{agent_name}'. "
-                    f"Available: {agent_names}"
-                )
-
-            agent = self._agents[agent_name]
-            instructions = _resolve_placeholders(instructions, results)
-            context = _build_context(results)
-
+        # ── 2a. Simple path — worker handles alone ─────────────────────
+        if not is_complex:
             if verbose:
-                print(f"\n[Worker:{agent_name}] Executing step {step_id}…")
+                print(f"\n[Worker:{self._engine}] Handling task independently…")
+            result = worker.execute(
+                system_prompt=agent_context,
+                instructions=task,
+            )
+            if verbose:
+                preview = result[:120].replace("\n", " ")
+                print(f"  Result preview: {preview}…")
+            return result
 
-            result = ""
-            for attempt in range(MAX_REVISIONS + 1):
-                result = agent.run(instructions, context)
-
-                if verbose:
-                    preview = result[:120].replace("\n", " ")
-                    print(f"  Result preview: {preview}…")
-
-                review = self._consultant.review(instructions, result)
-
-                if review["approved"]:
-                    if verbose:
-                        print(f"  [Consultant] ✓ Approved")
-                    break
-
-                if attempt < MAX_REVISIONS:
-                    feedback = review["feedback"]
-                    if verbose:
-                        print(f"  [Consultant] ✗ Revision requested: {feedback}")
-                    instructions = (
-                        f"{instructions}\n\n"
-                        f"[Revision request — attempt {attempt + 2}/{MAX_REVISIONS + 1}]:\n"
-                        f"{feedback}"
-                    )
-                else:
-                    if verbose:
-                        print(f"  [Consultant] Max revisions reached — accepting result")
-
-            results[step_id] = result
-
-        # ── 3. Synthesize ──────────────────────────────────────────────
+        # ── 2b. Complex path — consult Opus first ──────────────────────
         if verbose:
-            print("\n[Consultant] Synthesizing final output…")
+            print(f"\n[Consultant:Opus] Providing guidance for complex task…")
 
-        final = self._consultant.synthesize(task, list(results.values()))
-        return final
+        guidance = self._get_consultant().advise(task, reason)
 
+        if verbose:
+            preview = guidance[:120].replace("\n", " ")
+            print(f"  Guidance preview: {preview}…")
+            print(f"\n[Worker:{self._engine}] Executing with expert guidance…")
 
-# ── Helpers ───────────────────────────────────────────────────────────
+        result = worker.execute(
+            system_prompt=agent_context,
+            instructions=task,
+            guidance=guidance,
+        )
 
-def _resolve_placeholders(text: str, results: dict[int, str]) -> str:
-    """Replace {{step_N}} with the actual result of step N."""
-    def replacer(m: re.Match) -> str:
-        step_id = int(m.group(1))
-        return results.get(step_id, f"[step {step_id} not yet available]")
+        if verbose:
+            preview = result[:120].replace("\n", " ")
+            print(f"  Result preview: {preview}…")
 
-    return re.sub(r"\{\{step_(\d+)\}\}", replacer, text)
-
-
-def _build_context(results: dict[int, str]) -> str:
-    if not results:
-        return ""
-    parts = [f"Step {sid} result:\n{res}" for sid, res in sorted(results.items())]
-    return "\n\n".join(parts)
+        return result
